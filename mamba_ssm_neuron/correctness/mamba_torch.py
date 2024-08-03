@@ -6,18 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
-from torchtune.modules import RMSNorm as RMSNormGated
+from rmsnorm import RMSNorm as RMSNormGated
 import numpy as np
-
-
-def segsum_unstable(x):
-    """Naive segment sum calculation."""
-    T = x.size(-1)
-    x_cumsum = torch.cumsum(x, dim=-1)
-    x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
-    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
-    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
-    return x_segsum
+import torch_xla.core.xla_model as xm
+import random
 
 
 def segsum(x):
@@ -49,16 +41,16 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
 
     A = rearrange(A, "b c l h -> b h c l")
     A_cumsum = torch.cumsum(A, dim=-1)
-
     # 1. Compute the output for each intra-chunk (diagonal blocks)
     L = torch.exp(segsum(A))
+    xm.mark_step()
     Y_diag  = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
-
+    
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
     decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
     states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
-
+    
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
     if initial_states is None:
@@ -72,9 +64,8 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     # (left term of low-rank factorization of off-diagonal blocks; C terms)
     state_decay_out = torch.exp(A_cumsum)
     Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
-
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
-    Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
+    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
     return Y, final_state
 
 
@@ -126,7 +117,7 @@ class Mamba2Simple(nn.Module):
 
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
-        self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
+        self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, dtype=dtype)
 
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         self.conv1d = nn.Conv1d(
@@ -136,21 +127,20 @@ class Mamba2Simple(nn.Module):
             kernel_size=d_conv,
             groups=conv_dim,
             padding=d_conv - 1,
-            **factory_kwargs,
         )
         if self.conv_init is not None:
             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
         # self.conv1d.weight._no_weight_decay = True
 
         if self.learnable_init_states:
-            self.init_states = nn.Parameter(torch.zeros(self.nheads, self.headdim, self.d_state, **factory_kwargs))
+            self.init_states = nn.Parameter(torch.zeros(self.nheads, self.headdim, self.d_state), dtype=dtype)
             self.init_states._no_weight_decay = True
 
         self.act = nn.SiLU()
 
         # Initialize log dt bias
         dt = torch.exp(
-            torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.nheads) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         )
         dt = torch.clamp(dt, min=dt_init_floor)
@@ -163,21 +153,21 @@ class Mamba2Simple(nn.Module):
 
         # A parameter
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
+        A = torch.empty(self.nheads, dtype=torch.float32).uniform_(*A_init_range)
         A_log = torch.log(A).to(dtype=dtype)
         self.A_log = nn.Parameter(A_log)
         # self.register_buffer("A_log", torch.zeros(self.nheads, dtype=torch.float32, device=device), persistent=True)
         self.A_log._no_weight_decay = True
 
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+        self.D = nn.Parameter(torch.ones(self.nheads))
         self.D._no_weight_decay = True
         
         # Extra normalization layer right before output projection
         assert RMSNormGated is not None
-        self.norm = RMSNormGated(self.d_inner, eps=1e-5).to(device=device)
+        self.norm = RMSNormGated(self.d_inner, eps=1e-5)
 
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, dtype=dtype)
     
 
     
@@ -191,14 +181,12 @@ class Mamba2Simple(nn.Module):
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
         initial_states=repeat(self.init_states, "... -> b ...", b=batch) if self.learnable_init_states else None
-        dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
 
         z, xBC, dt = torch.split(
             zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
         )
         dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
         assert self.activation in ["silu", "swish"]
-
         xBC = self.act(
             self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
         )  # (B, L, self.d_inner + 2 * ngroups * d_state)
@@ -211,33 +199,33 @@ class Mamba2Simple(nn.Module):
         x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
         B = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
-        
-        y_torch, _ = ssd_minimal_discrete(x*dt.unsqueeze(-1), A*dt, B, C, block_len=self.chunk_size, initial_states=initial_states)
-        y_torch = y_torch + x * self.D[:, None]
-        y_torch = rearrange(y_torch, "b l h p -> b l (h p)")
-        
+        y, _ = ssd_minimal_discrete(x*dt.unsqueeze(-1), A*dt, B, C, block_len=self.chunk_size, initial_states=initial_states)
+        y = y + x * self.D[:, None]
+        y = rearrange(y, "b l h p -> b l (h p)")
         # Multiply "gate" branch and apply extra normalization layer
-        y_torch = self.norm(y_torch * self.act(z))
-        out = self.out_proj(y_torch)
+        y = self.norm(y * self.act(z))
+        out = self.out_proj(y)
         return out
 
 
 if __name__ == '__main__':
     dtype = torch.float32
+    # device = xm.xla_device()
     device = "cuda"
 
     seed = 0
     torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(0)
 
     seq_len: int = 1024
     d_model: int = 2560
-    model = Mamba2Simple(d_model=d_model, device=device, dtype=dtype)
+    model = Mamba2Simple(d_model=d_model, device=device, dtype=dtype).to(device=device, dtype=dtype)
 
     u = torch.rand((1, seq_len, d_model), dtype=dtype).to(device=device)
-    print(u)
-    
+    print(f"input: {u}")
     y = model(u)
     # loss = y.mean()
     # loss.backward()
+    xm.mark_step()
     print(y)
-    
